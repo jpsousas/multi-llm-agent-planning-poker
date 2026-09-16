@@ -65,3 +65,8 @@ CONDICOES = {
         max_rodadas=3
     ),
 }
+
+if __name__ == "__main__":
+    #meramente testes
+    for condicao_id, condicao in CONDICOES.items():
+        print(f"Condicao {condicao_id}: {condicao}")
