@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 #modelo padrao em 16 de dezembro de 2026
-MODELO_PADRAO = "google_genai:gemini-2.5-flash-lite"
+MODELO_PADRAO = "groq:openai/gpt-oss-120b"
 
 @dataclass
 class Condicao:
@@ -40,16 +40,16 @@ CONDICOES = {
     # C3: heterogeneo com papeis. Modelos DIFERENTES, mesmos papeis.
     "C3": Condicao(
         nome="heterogeneo_papeis",
-        agentes=[("backend", "backend", "openai/gpt-oss-120b"),
-        ("frontend", "frontend", "cohere/north-mini-code:free"),
+        agentes=[("backend", "backend", "groq:groq:openai/gpt-oss-120b"),
+        ("frontend", "frontend", "openrouter:poolside/laguna-s-2.1:free"),
         ("qa", "qa", "google_genai:gemini-2.5-flash-lite")],
     ),
     
     # Variantes com deliberacao e protocolo, para a RQ de ancoragem
     "C3_delib_simultaneo": Condicao(
     nome="heterogeneo_delib_simultaneo",
-        agentes=[("backend", "backend", "openai/gpt-oss-120b"),
-                 ("frontend", "frontend", "cohere/north-mini-code:free"),
+        agentes=[("backend", "backend", "groq:groq:openai/gpt-oss-120b"),
+                 ("frontend", "frontend", "openrouter:poolside/laguna-s-2.1:free"),
                  ("qa", "qa", "google_genai:gemini-2.5-flash-lite")],
         protocolo="simultaneo",
         deliberacao=True,
@@ -57,8 +57,8 @@ CONDICOES = {
     ),
     "C3_delib_sequencial": Condicao(
         nome="heterogeneo_delib_sequencial",
-        agentes=[("backend", "backend", "openai/gpt-oss-120b"),
-                 ("frontend", "frontend", "cohere/north-mini-code:free"),
+        agentes=[("backend", "backend", "groq:groq:openai/gpt-oss-120b"),
+                 ("frontend", "frontend", "openrouter:poolside/laguna-s-2.1:free"),
                  ("qa", "qa", "google_genai:gemini-2.5-flash-lite")],
         protocolo="sequencial",
         deliberacao=True,
