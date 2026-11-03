@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Dataset confidencial SIS-ASTROS (manter apenas o LEIA-ME.md)
+data/sis_astros/*.csv
+
+results/cache/*
+results/raw/*.jsonl
+results/transcripts/SIS-ASTROS/*/*.md
+results/*.json
+results/*.jsonl
+results/latex/*
