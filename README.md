@@ -1,7 +1,7 @@
 # MASPE — Planning Poker Multiagente com LLMs para Estimativa de Esforço
 
-Artefato do Trabalho de Conclusão de Curso (TCC) do Instituto de Computação da
-**Universidade Federal de Alagoas (UFAL)**, desenvolvido segundo o paradigma de
+Artefato do Trabalho de Conclusão de Curso (TCC) de Sistemas de Informação da
+**Universidade Federal de Santa Maria (UFSM)**, desenvolvido segundo o paradigma de
 **Design Science Research (DSR)**.
 
 Um comitê de **3 agentes** executa uma sessão de *Planning Poker* para estimar issues em
