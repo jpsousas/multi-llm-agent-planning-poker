@@ -10,6 +10,7 @@ Execução (a partir da pasta multi-llm-agent-planning-poker):
 import itertools
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -158,21 +159,59 @@ class TestRelatorio(unittest.TestCase):
         self.assertEqual(h5["transicoes_sigma"]["R1->R2"]["pct_diminuiu"], 100.0)
         self.assertEqual(h5["curva_sigma"]["R3"]["n_itens_que_chegaram"], 6)
 
-    def test_h6_amostra_e_kappa(self):
+    def test_h6_amostra(self):
         amostra = an.gerar_amostra_h6(self.df)
         self.assertEqual(amostra["issue_id"].nunique(), 10)
         self.assertEqual(len(amostra), 5 * 3 + 5 * 9)  # 60 justificativas
-        with tempfile.TemporaryDirectory() as pasta:
-            a, b = Path(pasta) / "a.csv", Path(pasta) / "b.csv"
-            ca = amostra.assign(fator_principal=["complexidade" if i % 2 else "volume" for i in range(len(amostra))])
-            cb = ca.copy()
-            cb.loc[cb.index[:6], "fator_principal"] = "risco"
-            ca.to_csv(a, index=False)
-            cb.to_csv(b, index=False)
-            k = an.concordancia_h6(str(a), str(b))
-        self.assertEqual(k["n_justificativas"], 60)
-        self.assertEqual(k["n_divergencias"], 6)
-        self.assertTrue(0 < k["kappa_cohen"] < 1)
+        # Kappa do H6 calculado manualmente: concordancia_h6 está comentada em src/analysis.py.
+        # with tempfile.TemporaryDirectory() as pasta:
+        #     a, b = Path(pasta) / "a.csv", Path(pasta) / "b.csv"
+        #     ca = amostra.assign(fator_principal=["complexidade" if i % 2 else "volume" for i in range(len(amostra))])
+        #     cb = ca.copy()
+        #     cb.loc[cb.index[:6], "fator_principal"] = "risco"
+        #     ca.to_csv(a, index=False)
+        #     cb.to_csv(b, index=False)
+        #     k = an.concordancia_h6(str(a), str(b))
+        # self.assertEqual(k["n_justificativas"], 60)
+        # self.assertEqual(k["n_divergencias"], 6)
+        # self.assertTrue(0 < k["kappa_cohen"] < 1)
+
+    def test_erros_vs_time_spent(self):
+        casos = [  # (ground truth, predito, Time Spent)
+            (8, 5, 5.8333),  # exemplo: modelo mais próximo (0,83 vs 2,17)
+            (5, 8, 5.0),     # GT mais próximo
+            (3, 5, 4.0),     # empate (1 vs 1)
+            (8, 13, None),   # erro sem Time Spent
+            (8, 13, 0.0),    # Time Spent zero = sem registro
+            (8, 8, 7.0),     # acerto: fora da análise de erros
+        ]
+        df = pd.DataFrame([
+            {**_sessao(i, an.COND_SIM_ESP, gt, p, [[p] * 3], "consenso_unanime_r1"), "esforco_real_horas": ts}
+            for i, (gt, p, ts) in enumerate(casos)
+        ])
+        t = an.tabela_erros_vs_esforco(df).set_index("issue_id")
+        self.assertEqual(t.loc["0", "mais_proximo"], "modelo")
+        self.assertAlmostEqual(t.loc["0", "dist_predito_time_spent"], 0.8333)
+        self.assertAlmostEqual(t.loc["0", "dist_gt_time_spent"], 2.1667)
+        self.assertEqual(t.loc["1", "mais_proximo"], "ground_truth")
+        self.assertEqual(t.loc["2", "mais_proximo"], "empate")
+        self.assertEqual(t.loc["3", "mais_proximo"], "sem_time_spent")
+        self.assertEqual(t.loc["4", "mais_proximo"], "sem_time_spent")
+        self.assertNotIn("5", t.index)
+
+        r = an.analisar_erros_vs_esforco(df)
+        self.assertEqual((r["n_itens"], r["n_acertos"], r["n_erros"]), (6, 1, 5))
+        self.assertEqual((r["n_erros_sem_time_spent"], r["n_erros_analisados"]), (2, 3))
+        self.assertEqual(r["mais_proximo_do_time_spent"]["modelo"]["n"], 1)
+        self.assertEqual(r["mais_proximo_do_time_spent"]["ground_truth"]["n"], 1)
+        self.assertEqual(r["mais_proximo_do_time_spent"]["empate"]["n"], 1)
+        self.assertEqual(r["teste_distancia_time_spent"]["n_pares"], 3)
+
+    def test_erros_vs_time_spent_resultados_sem_a_coluna(self):
+        r = an.analisar_erros_vs_esforco(self.df, an.COND_SEQ_ESP)
+        self.assertEqual(r["n_erros"], 12)
+        self.assertEqual(r["n_erros_analisados"], 0)
+        self.assertEqual(r["status"], "sem_erros_com_time_spent")
 
     def test_relatorio_completo(self):
         with tempfile.TemporaryDirectory() as pasta:
@@ -187,9 +226,44 @@ class TestRelatorio(unittest.TestCase):
             try:
                 rel = an.gerar_relatorio_completo(str(raw / "*.jsonl"), modelo="m", modo_contexto="rag")
                 self.assertTrue(Path("results/latex/tabela_rq1__m__rag.tex").exists())
+                self.assertTrue(Path("results/analysis/erros_vs_time_spent__m__rag.csv").exists())
+                for nome in ("rq2_1_h2", "rq2_2_h3", "rq3_h4", "rq3_h4_trajetoria", "rq4_h5_encerramento",
+                             "rq4_h5_curva", "rq4_h5_transicoes", "erros_time_spent"):
+                    self.assertTrue(Path(f"results/latex/tabela_{nome}__m__rag.tex").exists(), nome)
+                todas = Path("results/latex/tabelas_todas__m__rag.tex").read_text(encoding="utf-8")
+                self.assertEqual(todas.count("\\begin{table}"), 9)
             finally:
                 os.chdir(cwd)
         self.assertEqual(rel["itens_por_condicao"][an.COND_SIM_ESP], 12)
+
+    def _relatorio_de(self, df):
+        return {
+            "RQ1_H1": an.analisar_rq1_h1(df),
+            "RQ2_1_H2": an.analisar_rq2_1_h2(df),
+            "RQ2_2_H3": an.analisar_rq2_2_h3(df),
+            "RQ3_H4": an.analisar_rq3_h4(df),
+            "RQ4_H5": {c: an.analisar_rq4_h5(df, c) for c in an.CONDICOES},
+            "Erros_vs_TimeSpent": {c: an.analisar_erros_vs_esforco(df, c) for c in an.CONDICOES},
+        }
+
+    def test_tabelas_latex_conteudo(self):
+        tabelas = an.gerar_tabelas_latex(self._relatorio_de(self.df))
+        for nome, tabela in tabelas.items():
+            self.assertIn("\\begin{tabular}", tabela, nome)
+            self.assertIsNone(re.search(r"\bnan\b", tabela.lower()), nome)
+        # Encerramento do simultâneo especializado: 6 de 12 unânimes na R1, com vírgula decimal
+        self.assertIn("Unanimidade na R1 & 6 (50{,}0\\%)", tabelas["rq4_h5_encerramento"])
+        # Sem baseline por issue, H3 é descritiva: sem p-valor na linha do MASPE
+        self.assertIn("não pode ser testada", tabelas["rq2_2_h3"])
+        self.assertIn("\\multicolumn{8}{l}{\\textit{Análise secundária", tabelas["rq2_1_h2"])
+        self.assertIn("Revisões do agente-âncora", tabelas["rq3_h4"])
+
+    def test_tabelas_latex_com_condicao_ausente(self):
+        parcial = self.df[self.df.condicao == an.COND_SIM_ESP]
+        tabelas = an.gerar_tabelas_latex(self._relatorio_de(parcial))
+        self.assertTrue(tabelas["rq2_1_h2"].startswith("% Sem dados"))
+        self.assertTrue(tabelas["rq3_h4"].startswith("% Sem dados"))
+        self.assertIn("Unanimidade na R1 & 6 (50{,}0\\%) & --- & --- & ---", tabelas["rq4_h5_encerramento"])
 
 
 if __name__ == "__main__":

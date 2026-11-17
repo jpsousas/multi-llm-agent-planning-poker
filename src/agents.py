@@ -26,7 +26,6 @@ def obter_modelo(identificador: str, temperatura: float, api_key_env_var: Option
         provedor, modelo = identificador.split(":", 1)
 
         if provedor in ("local", "ollama", "lmstudio", "vllm"):
-            # DeepSeek-R1-Distill-Llama-70B servido localmente
             _cache[chave_cache] = ChatOpenAI(
                 model=modelo,
                 temperature=temperatura,
@@ -201,7 +200,8 @@ def estimar(
             protocolo=protocolo
         )),
     ]
-    print(mensagens[1].content)  # DEBUG: imprime o prompt completo enviado ao modelo
+    if os.getenv("DEBUG_PROMPT", "0") == "1":    # confidencial: nunca ligar em execuções que vão para log compartilhado
+        print(mensagens[1].content)
     max_tentativas = 3
     intervalo_base = 2.0
 

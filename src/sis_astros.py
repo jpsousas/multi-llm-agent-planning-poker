@@ -30,21 +30,52 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
+from src.limpeza_texto import preparar_descricao, truncar_para_orcamento, contar_tokens
+
 from src.config import (
     CAMINHO_SIS_ASTROS,
     COLUNAS_SIS_ASTROS,
     COLUNAS_OBRIGATORIAS_SIS_ASTROS,
     RAIZ_PROJETO,
-    LIMITE_DESCRICAO_PROMPT,
+    LIMIAR_DUPLICATA,
+    K_RAG,
 )
 
 
-def cortar_descricao(texto: Optional[str], limite: Optional[int] = LIMITE_DESCRICAO_PROMPT) -> str:
-    """Aplica o mesmo limite de caracteres à issue alvo e às históricas (None = sem corte)."""
-    texto = (texto or "").strip()
-    if limite is not None and len(texto) > limite:
-        return texto[:limite].rstrip() + "..."
-    return texto
+# Orçamentos de tokens da DESCRIÇÃO (após a limpeza determinística). Valem para todos os agentes,
+# rodadas e condições. Ajuste por .env só no desenvolvimento; congele antes do teste.
+# Prioridade no prompt: instruções > issue alvo > exemplos. Só os EXEMPLOS são truncados.
+#   ORCAMENTO_TOKENS_EXEMPLO : teto por exemplo (o orçamento real pode ser menor, veja abaixo)
+#   ORCAMENTO_TOKENS_ALVO    : 0 = alvo completo (padrão); >0 = teto para o alvo
+#   CONTEXTO_SERVIDOR_POR_SLOT / RESERVA_PROMPT_TOKENS: o orçamento do exemplo encolhe quando o alvo é
+#   grande, para que  alvo + k*exemplo + reserva  <=  contexto. A reserva cobre instruções (~500), debate
+#   (até 3 justificativas), saída do modelo (max_tokens) e margem.
+ORCAMENTO_TOKENS_EXEMPLO = int(os.getenv("ORCAMENTO_TOKENS_EXEMPLO", "2500"))
+ORCAMENTO_TOKENS_ALVO = int(os.getenv("ORCAMENTO_TOKENS_ALVO", "0")) or None
+CONTEXTO_SERVIDOR_POR_SLOT = int(os.getenv("CONTEXTO_SERVIDOR_POR_SLOT", "16384"))
+RESERVA_PROMPT_TOKENS = int(os.getenv("RESERVA_PROMPT_TOKENS", "5000"))
+PISO_ORCAMENTO_EXEMPLO = 200
+
+
+def orcamento_exemplo_dinamico(tokens_alvo: int, k: int) -> int:
+    """Teto por exemplo = min(teto configurado, espaço que sobra no contexto dividido por k)."""
+    sobra = CONTEXTO_SERVIDOR_POR_SLOT - RESERVA_PROMPT_TOKENS - tokens_alvo
+    return max(PISO_ORCAMENTO_EXEMPLO, min(ORCAMENTO_TOKENS_EXEMPLO, sobra // max(k, 1)))
+# LIMPAR_TEXTO=0 (padrão): texto original, só truncado pelo orçamento. LIMPAR_TEXTO=1: limpeza determinística antes.
+LIMPAR_TEXTO = os.getenv("LIMPAR_TEXTO", "0").lower() in ("1", "true", "sim")
+
+
+def preparar_texto(texto: Optional[str], max_tokens: Optional[int]) -> Tuple[str, Dict[str, int]]:
+    """Descrição pronta para o prompt (alvo e exemplos usam a mesma regra). Devolve (texto, meta numérico)."""
+    if max_tokens is None:                       # sem teto: texto completo (só normaliza quebras de linha)
+        max_tokens = 10 ** 9
+    if LIMPAR_TEXTO:
+        return preparar_descricao(texto, max_tokens)
+    original = (texto or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    pronto, truncado = truncar_para_orcamento(original, max_tokens)
+    return pronto, {"caracteres_antes": len(texto or ""), "caracteres_final": len(pronto),
+                    "tokens_final": contar_tokens(pronto), "truncado": int(truncado)}
+
 
 # Escala pura de Fibonacci do SIS-ASTROS (1 SP = 1h)
 ESCALA_SIS_ASTROS = [1, 2, 3, 5, 8, 13, 21, 34, 55]
@@ -53,7 +84,7 @@ ESCALA_SIS_ASTROS_SET = set(ESCALA_SIS_ASTROS)
 CAMINHO_MANIFESTO_SPLIT = RAIZ_PROJETO / "results" / "split_sis_astros.json"
 
 # Conversões de unidade do GitLab (padrão da plataforma: 1d = 8h, 1w = 5d)
-_HORAS_POR_UNIDADE = {"w": 40.0, "d": 8.0, "h": 1.0, "m": 1.0 / 60.0}
+_HORAS_POR_UNIDADE = {"w": 40.0, "d": 8.0, "h": 1.0, "m": 1.0 / 60.0, "s": 1.0 / 3600.0}
 
 
 # ==============================================================================
@@ -99,7 +130,8 @@ def _parse_estimativa(valor) -> Tuple[Optional[float], Optional[str]]:
 
 def parse_horas_gitlab(valor) -> Optional[float]:
     """
-    Converte "Time Spent" para horas. Aceita '8', '8.5', '8h', '1h 30m', '45m', '1d 2h'.
+    Converte "Time Spent" para horas. Aceita '8', '8.5', '8h', '1h 30m', '45m', '1d 2h',
+    '1h 30m 20s' (formato GitLab com segundos).
     Retorna None quando ausente ou ilegível (nunca inventa um valor).
     """
     if valor is None or (not isinstance(valor, str) and pd.isna(valor)):
@@ -111,8 +143,8 @@ def parse_horas_gitlab(valor) -> Optional[float]:
         return float(s)
     except ValueError:
         pass
-    partes = re.findall(r"(\d+(?:\.\d+)?)\s*([wdhm])", s)
-    if not partes or re.sub(r"(\d+(?:\.\d+)?)\s*([wdhm])|\s", "", s):
+    partes = re.findall(r"(\d+(?:\.\d+)?)\s*([wdhms])", s)
+    if not partes or re.sub(r"(\d+(?:\.\d+)?)\s*([wdhms])|\s", "", s):
         return None
     return sum(float(n) * _HORAS_POR_UNIDADE[u] for n, u in partes)
 
@@ -334,10 +366,12 @@ def dividir_temporal(
 # Exemplos históricos para o prompt
 # ==============================================================================
 
-def formatar_exemplo(item: Dict, max_desc: Optional[int] = LIMITE_DESCRICAO_PROMPT) -> Dict:
+def formatar_exemplo(item: Dict, max_tokens: int = ORCAMENTO_TOKENS_EXEMPLO) -> Dict:
     """Converte um item histórico para o formato consumido por prompts.montar_prompt_item."""
-    # Quebras de linha viram espaço: cada exemplo ocupa uma linha da lista no prompt
-    desc = " ".join(cortar_descricao(item.get("Description"), max_desc).split())
+    # Limpeza determinística + orçamento de tokens (mesma regra do alvo, orçamento menor).
+    # Quebras de linha viram espaço: cada exemplo ocupa uma linha da lista no prompt.
+    texto, _meta = preparar_texto(item.get("Description"), max_tokens)
+    desc = " ".join(texto.split())
     ex = {
         "id": str(item.get("ID", "")),
         "titulo": item.get("Title", ""),
@@ -392,49 +426,95 @@ def montar_dataset_sis_astros(
     n_historico: int = 3,
     split: float = 0.7,
     usar_rag: bool = False,
-    k_rag: int = 3,
+    k_rag: int = K_RAG,
+    fase: str = "teste",
+    split_dev: float = 0.7,
+    limiar_duplicata: Optional[float] = LIMIAR_DUPLICATA,
 ) -> List[Dict]:
     """
-    Carrega o CSV, aplica o split temporal e devolve os itens de TESTE prontos para o runner.
+    Carrega o CSV, aplica o split temporal e devolve os itens a estimar prontos para o runner.
 
-    - usar_rag=False: few-shot scale-aware com `n_historico` exemplos do histórico.
-    - usar_rag=True : RAG semântico — os `k_rag` itens do histórico mais parecidos com cada issue,
-      excluindo a própria issue e qualquer item criado depois dela.
+    fase="teste" (padrão): alvos = 30% mais recentes; base de exemplos = os 70% mais antigos.
+    fase="dev"           : alvos = os últimos (1 - split_dev) da base histórica; base de exemplos = os
+                           split_dev mais antigos dela. O bloco de TESTE não é lido nem como exemplo.
+                           Use para calibrar limiar_duplicata, orçamentos de tokens, prompts e
+                           convergência ANTES de congelar a configuração.
+
+    - usar_rag=False: few-shot scale-aware com `n_historico` exemplos da base.
+    - usar_rag=True : RAG semântico — os `k_rag` itens da base mais parecidos com cada issue,
+      excluindo a própria issue, itens criados depois dela, conteúdo idêntico e (se informado)
+      similaridade >= limiar_duplicata.
     Os mesmos exemplos vão para os 3 agentes e reaparecem em todas as rodadas do debate.
+    A descrição (alvo e exemplos) passa por limpeza determinística + orçamento de tokens; os
+    contadores agregados ficam em `prep_meta` e `rag_meta` (nunca texto).
     """
+    if fase not in ("teste", "dev"):
+        raise ValueError("fase deve ser 'teste' ou 'dev'")
     caminho = resolver_caminho(caminho_arquivo)
     itens = carregar_sis_astros(str(caminho))
-    treino, teste = dividir_temporal(itens, split, caminho_csv=str(caminho))
+    historico, teste = dividir_temporal(itens, split, caminho_csv=str(caminho))
+
+    if fase == "dev":
+        corte = int(len(historico) * split_dev)
+        base, alvos = historico[:corte], historico[corte:]
+        print(f"[SIS-ASTROS] FASE DEV: base de exemplos={len(base)} | alvos={len(alvos)} "
+              f"(bloco de teste com {len(teste)} itens NÃO utilizado)")
+    else:
+        base, alvos = historico, teste
 
     indice = None
     if usar_rag:
-        from src.retrieval import construir_indice
-        indice = construir_indice(treino, str(caminho))
+        from src.retrieval import construir_indice, buscar_com_diagnostico
+        # a chave do cache já inclui os IDs da base, então dev e teste nunca compartilham índice
+        indice = construir_indice(base, str(caminho))
 
     dataset = []
-    for item in teste:
+    k_ctx = k_rag if usar_rag else n_historico
+    for item in alvos:
+        # 1) alvo completo (ou com o teto configurado)
+        descricao, prep_meta = preparar_texto(item.get("Description"), ORCAMENTO_TOKENS_ALVO)
+        orc_ex = orcamento_exemplo_dinamico(contar_tokens(descricao), k_ctx)
+
+        # 2) exemplos, truncados ao orçamento dinâmico
+        rag_meta = None
         if usar_rag:
-            from src.retrieval import buscar_issues_similares, formatar_historicos_rag
-            historicos = formatar_historicos_rag(buscar_issues_similares(
+            similares, rag_meta = buscar_com_diagnostico(
                 titulo_alvo=item["Title"],
                 descricao_alvo=item.get("Description", ""),
                 iid_alvo=item["ID"],
                 data_alvo=item.get("Creation_Date"),
                 indice=indice,
                 k=k_rag,
-            ))
+                limiar_duplicata=limiar_duplicata,
+            )
+            historicos = []
+            for sim in similares:
+                ex = formatar_exemplo(sim, orc_ex)
+                ex["similaridade"] = round(float(sim.get("similaridade", 0.0)), 3)
+                historicos.append(ex)
         else:
-            historicos = [formatar_exemplo(h) for h in _amostrar_few_shot_estratificado(treino, n=n_historico, item_alvo=item)]
+            historicos = [formatar_exemplo(h, orc_ex) for h in _amostrar_few_shot_estratificado(base, n=n_historico, item_alvo=item)]
+
+        tokens_ex = [contar_tokens(h["descricao"]) for h in historicos]
+        prep_meta.update(
+            orcamento_exemplo=orc_ex,
+            tokens_alvo=contar_tokens(descricao),
+            tokens_exemplos=sum(tokens_ex),
+            exemplos_truncados=sum(1 for h in historicos if "[... texto truncado ...]" in h["descricao"]),
+        )
 
         dataset.append({
             "issue_id": str(item["ID"]),
             "titulo": item["Title"],
-            "descricao": cortar_descricao(item["Description"]),
+            "descricao": descricao,
             "ground_truth": float(item["Story_Point"]),
             "esforco_real_horas": item.get("Tempo_Gasto_Horas"),
             "modo_contexto": "rag" if usar_rag else "few_shot",
-            "k_contexto": k_rag if usar_rag else n_historico,
+            "k_contexto": k_ctx,
+            "fase": fase,
             "historicos": historicos,
+            "prep_meta": prep_meta,     # contadores (alvo, exemplos, truncamentos); nunca texto
+            "rag_meta": rag_meta,       # diagnóstico do vazamento (None sem RAG)
         })
 
     return dataset

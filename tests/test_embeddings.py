@@ -1,4 +1,4 @@
-﻿"""
+"""
 tests/test_embeddings.py
 ========================
 Teste isolado do módulo de recuperação semântica (RAG).
@@ -22,6 +22,10 @@ O que testa:
   6. Cache: modelo carregado uma vez; cache distinto quando muda o conjunto indexado.
   7. Diagnóstico de distribuição: impressão legível da distribuição por SP.
   8. (Opcional) Integração com o CSV real em CAMINHO_SIS_ASTROS — pulado se não existir.
+  9. (Sem download) Diagnóstico de vazamento: quase-duplicatas (limiar 0,95), conteúdo idêntico,
+     causalidade temporal e modelo/limiar vindos de src/config.py — usa um encoder falso.
+
+As classes TestEmbeddingsRAG e TestEmbeddingsComCSVReal usam o modelo REAL (mpnet, baixado na 1ª vez).
 
 O cache dos testes vai para uma pasta temporária (não suja results/cache).
 """
@@ -37,9 +41,11 @@ from datetime import datetime, timedelta, timezone
 # Garante que src/ seja encontrado
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from src.config import MODELO_EMBEDDINGS, LIMIAR_DUPLICATA
 from src.retrieval import (
     construir_indice,
     buscar_issues_similares,
+    buscar_com_diagnostico,
     formatar_historicos_rag,
     resetar_indice,
     obter_modelo_embeddings,
@@ -225,6 +231,7 @@ class TestEmbeddingsRAG(unittest.TestCase):
         self.assertIsInstance(emb, np.ndarray)
         self.assertEqual(emb.ndim, 2)
         self.assertEqual(emb.shape[0], len(ISSUES_MOCK))
+        self.assertEqual(emb.shape[1], 768)            # paraphrase-multilingual-mpnet-base-v2
         print(f"  [OK] Shape dos embeddings: {emb.shape}")
 
     def test_02_embeddings_normalizados(self):
@@ -279,7 +286,7 @@ class TestEmbeddingsRAG(unittest.TestCase):
     def test_06_similaridade_intra_cluster_maior_que_inter_cluster(self):
         """A similaridade entre issues do mesmo cluster deve ser maior que entre clusters opostos."""
         from sentence_transformers import SentenceTransformer
-        modelo = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+        modelo = SentenceTransformer(MODELO_EMBEDDINGS)
 
         texto_auth = _texto_para_embedding("Implementar autenticação JWT", "Endpoint de login com token.")
         texto_relat = _texto_para_embedding("Gerar relatório de burndown", "Dashboard de progresso do sprint.")
@@ -459,6 +466,108 @@ class TestEmbeddingsRAG(unittest.TestCase):
 
 
 # ==============================================================================
+# Diagnóstico de vazamento (sem baixar modelo: encoder falso por saco de palavras)
+# ==============================================================================
+
+from tests.fakes import FakeEncoder, patch_retrieval
+
+_PALAVRAS = "implementar autenticacao usuarios login token refresh endpoint seguro sessao expiracao cadastro perfil relatorio exportar pdf sprint grafico"
+
+
+def _it(iid, titulo, desc, dia, sp=5.0):
+    return {"ID": str(iid), "Title": titulo, "Description": desc, "Story_Point": sp, "Tempo_Gasto_Horas": None,
+            "Creation_Date": f"2024-01-{dia:02d}T10:00:00Z"}
+
+
+class TestDiagnosticoRecuperacao(unittest.TestCase):
+
+    def setUp(self):
+        self.ctx = patch_retrieval()
+        self.r = self.ctx.__enter__()
+        self.csv = tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False)
+        self.csv.write("a,b\n1,2\n")
+        self.csv.close()
+        self.itens = [
+            _it(1, "Login com JWT", _PALAVRAS, 1, 8.0),                                  # base para quase-duplicata
+            _it(2, "Relatório em PDF", "relatorio exportar pdf sprint grafico", 2, 5.0),
+            _it(3, "Cadastro de perfil", "cadastro perfil usuarios", 3, 3.0),
+            _it(4, "Sessão", "sessao expiracao token", 4, 2.0),
+        ]
+        self.indice = construir_indice(self.itens, self.csv.name)
+
+    def tearDown(self):
+        os.unlink(self.csv.name)
+        self.ctx.__exit__(None, None, None)
+
+    def test_modelo_e_limiar_vem_do_config(self):
+        self.assertIn("mpnet", MODELO_EMBEDDINGS)
+        self.assertEqual(self.indice["modelo"], MODELO_EMBEDDINGS)
+        self.assertEqual(LIMIAR_DUPLICATA, 0.95)
+        import inspect
+        self.assertEqual(inspect.signature(buscar_com_diagnostico).parameters["limiar_duplicata"].default, 0.95)
+        self.assertEqual(inspect.signature(buscar_issues_similares).parameters["limiar_duplicata"].default, 0.95)
+
+    def test_chave_do_cache_depende_do_modelo(self):
+        from unittest.mock import patch
+        chave = self.indice["chave"]
+        with patch.object(self.r, "MODELO_EMBEDDINGS", "outro/modelo"):
+            self.r.resetar_indice()
+            outra = construir_indice(self.itens, self.csv.name)["chave"]
+        self.assertNotEqual(chave, outra)
+
+    def test_quase_duplicata_e_excluida_pelo_limiar_padrao(self):
+        alvo_desc = _PALAVRAS + " novo"                                   # 1 palavra a mais -> cosseno ≈ 0,97
+        sim, meta = buscar_com_diagnostico("Login com JWT", alvo_desc, "99", "2024-02-01T00:00:00Z", self.indice, k=3)
+        self.assertNotIn("1", [s["ID"] for s in sim])
+        self.assertGreaterEqual(meta["sim_max"], 0.95)
+        self.assertEqual(meta["n_removidas_limiar"], 1)
+        self.assertEqual(meta["limiar"], 0.95)
+
+    def test_sem_limiar_a_quase_duplicata_volta(self):
+        alvo_desc = _PALAVRAS + " novo"
+        sim, meta = buscar_com_diagnostico("Login com JWT", alvo_desc, "99", "2024-02-01T00:00:00Z", self.indice, k=3, limiar_duplicata=None)
+        self.assertEqual(sim[0]["ID"], "1")
+        self.assertEqual(meta["n_removidas_limiar"], 0)
+        self.assertIsNone(meta["limiar"])
+
+    def test_conteudo_identico_sempre_excluido(self):
+        sim, meta = buscar_com_diagnostico("login com jwt", "  " + _PALAVRAS.upper() + " ", "99", "2024-02-01T00:00:00Z",
+                                           self.indice, k=3, limiar_duplicata=None)
+        self.assertEqual(meta["n_conteudo_identico"], 1)
+        self.assertNotIn("1", [s["ID"] for s in sim])
+
+    def test_causalidade_temporal_e_id(self):
+        sim, meta = buscar_com_diagnostico("Sessão", "sessao expiracao token", "4", "2024-01-03T00:00:00Z", self.indice, k=10)
+        ids = {s["ID"] for s in sim}
+        self.assertEqual(ids & {"3", "4"}, set())                          # a própria (ID) e as criadas depois/na mesma data
+        self.assertEqual(meta["n_elegiveis"], 2)
+
+    def test_k_e_ordem_por_similaridade(self):
+        sim, _ = buscar_com_diagnostico("Exportar relatório", "relatorio exportar pdf", "99", None, self.indice, k=2)
+        self.assertEqual(len(sim), 2)
+        self.assertEqual(sim[0]["ID"], "2")
+        self.assertGreaterEqual(sim[0]["similaridade"], sim[1]["similaridade"])
+
+    def test_sem_elegiveis(self):
+        sim, meta = buscar_com_diagnostico("x", "y", "99", "2023-01-01T00:00:00Z", self.indice, k=3)
+        self.assertEqual(sim, [])
+        self.assertEqual(meta["n_elegiveis"], 0)
+        self.assertIsNone(meta["sim_max"])
+
+    def test_buscar_issues_similares_continua_compativel(self):
+        sim = buscar_issues_similares("Exportar relatório", "relatorio exportar pdf", "99", None, self.indice, k=1)
+        self.assertEqual([s["ID"] for s in sim], ["2"])
+
+    def test_texto_do_embedding_usa_400_caracteres_da_descricao(self):
+        t = _texto_para_embedding("Título", "x" * 1000)
+        self.assertEqual(t, "Título - " + "x" * 400)
+        self.assertEqual(_texto_para_embedding("Só título", ""), "Só título")
+
+    def test_embeddings_do_indice_estao_normalizados(self):
+        np.testing.assert_allclose(np.linalg.norm(self.indice["embeddings"], axis=1), 1.0, atol=1e-5)
+
+
+# ==============================================================================
 # Teste de integração com SIS-ASTROS real (opcional — pula se não encontrar o CSV)
 # ==============================================================================
 
@@ -506,7 +615,7 @@ class TestEmbeddingsComCSVReal(unittest.TestCase):
 if __name__ == "__main__":
     print("=" * 70)
     print("MASPE — Teste de Recuperação Semântica (RAG) de Issues Históricas")
-    print("Modelo de embeddings: paraphrase-multilingual-MiniLM-L12-v2")
+    print(f"Modelo de embeddings: {MODELO_EMBEDDINGS}")
     print("=" * 70)
     print()
 
@@ -514,6 +623,7 @@ if __name__ == "__main__":
     loader.sortTestMethodsUsing = None  # mantém ordem de definição
     suite = unittest.TestSuite()
     suite.addTests(loader.loadTestsFromTestCase(TestEmbeddingsRAG))
+    suite.addTests(loader.loadTestsFromTestCase(TestDiagnosticoRecuperacao))
     suite.addTests(loader.loadTestsFromTestCase(TestEmbeddingsComCSVReal))
 
     runner = unittest.TextTestRunner(verbosity=2)

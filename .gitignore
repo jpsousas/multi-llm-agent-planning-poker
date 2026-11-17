@@ -226,3 +226,5 @@ results/transcripts/SIS-ASTROS/*/*.md
 results/*.json
 results/*.jsonl
 results/latex/*
+results/analysis/*.csv
+results/metrics.csv

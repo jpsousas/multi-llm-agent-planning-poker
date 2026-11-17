@@ -141,7 +141,7 @@ def _rotear_rodada(state: ConsensoState, *, max_rodadas: int, deliberacao: bool)
     """Decide se encerra a sessão ou realiza uma nova rodada de debate CoT."""
     if not deliberacao:
         return END
-    # Encerra se atingiu o critério de convergência (unanimidade na R1, unanimidade/adjacência na R2 ou consenso na R3)
+    # Encerra por unanimidade (R1-R3) ou estagnação na R2 (ver consensus.avaliar_convergencia_rodada)
     if state.get("convergiu", False):
         return END
     # Encerra se atingiu o limite máximo de rodadas (R_max = 3)

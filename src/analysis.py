@@ -33,7 +33,11 @@ Mapeamento RQ/H -> procedimento:
            que chegaram à rodada seguinte; distribuição dos motivos de encerramento e das rodadas.
   RQ4/H6   amostra de 10 sessões (5 unânimes na R1 + 5 com mais rodadas). Unidade de codificação:
            a justificativa CoT individual de cada agente em cada rodada (≥ 30 textos: 10 sessões
-           x 3 agentes na R1, mais as rodadas de debate). Concordância pelo Kappa de Cohen.
+           x 3 agentes na R1, mais as rodadas de debate). Concordância pelo Kappa de Cohen,
+           calculada manualmente (o código de concordancia_h6 está comentado).
+  Exploratório  Erros do consenso vs esforço real: nas issues com predito ≠ ground truth, compara
+           |predito − Time Spent| com |ground truth − Time Spent|. No projeto, 1 SP = 1 h, então
+           SP e horas são diretamente comparáveis. Time Spent ausente ou zero fica de fora.
 
 Convenções estatísticas:
   - Â12 (Vargha & Delaney, 2000) sobre todos os pares (produto cartesiano):
@@ -57,7 +61,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from scipy.stats import mannwhitneyu, spearmanr, wilcoxon
-from sklearn.metrics import cohen_kappa_score
+# from sklearn.metrics import cohen_kappa_score  # Kappa do H6 calculado manualmente
 
 from src.consensus import desvio_padrao_sp, calcular_dispersao_degraus
 
@@ -670,67 +674,463 @@ def gerar_amostra_h6(
     return amostra
 
 
-def concordancia_h6(arquivo_a: str, arquivo_b: str, coluna: str = "fator_principal") -> dict:
+# Kappa do H6 calculado manualmente por enquanto. Para reativar, descomente esta função,
+# o import de cohen_kappa_score e o argumento --kappa no bloco __main__.
+#
+# def concordancia_h6(arquivo_a: str, arquivo_b: str, coluna: str = "fator_principal") -> dict:
+#     """
+#     Kappa de Cohen (sklearn) entre as planilhas dos dois avaliadores.
+#     Unidade: justificativa CoT individual (chave issue_id + rodada + agente).
+#     """
+#     chave = ["issue_id", "rodada", "agente"]
+#     a = pd.read_csv(arquivo_a, dtype=str).set_index(chave)[coluna].fillna("").str.strip().str.lower()
+#     b = pd.read_csv(arquivo_b, dtype=str).set_index(chave)[coluna].fillna("").str.strip().str.lower()
+#     comuns = a.index.intersection(b.index)
+#     if len(comuns) == 0:
+#         raise ValueError("As planilhas dos avaliadores não têm justificativas em comum.")
+#     va, vb = a.loc[comuns].tolist(), b.loc[comuns].tolist()
+#     return {
+#         "unidade": "justificativa CoT individual (agente x rodada)",
+#         "n_justificativas": len(comuns),
+#         "kappa_cohen": float(cohen_kappa_score(va, vb)),
+#         "concordancia_bruta_pct": float(np.mean([x == y for x, y in zip(va, vb)]) * 100),
+#         "n_divergencias": int(sum(x != y for x, y in zip(va, vb))),
+#     }
+
+
+# ==============================================================================
+# 9. ERROS DO CONSENSO VS ESFORÇO REAL (TIME SPENT)
+# ==============================================================================
+
+COLUNAS_ERROS_ESFORCO = [
+    "issue_id", "condicao", "titulo", "ground_truth", "predito", "time_spent_h",
+    "dist_predito_time_spent", "dist_gt_time_spent", "mais_proximo",
+]
+
+
+def tabela_erros_vs_esforco(df: pd.DataFrame, condicao: str = COND_SIM_ESP) -> pd.DataFrame:
     """
-    Kappa de Cohen (sklearn) entre as planilhas dos dois avaliadores.
-    Unidade: justificativa CoT individual (chave issue_id + rodada + agente).
+    Uma linha por issue em que o consenso errou (predito ≠ ground truth), com a distância de
+    cada estimativa ao Time Spent (1 SP = 1 h). Time Spent ausente ou zero (sem registro de
+    esforço) fica como NaN, com mais_proximo = "sem_time_spent".
+    Ex.: GT 8, predito 5, Time Spent 5,8333 h -> distâncias 2,17 (GT) e 0,83 (predito): "modelo".
     """
-    chave = ["issue_id", "rodada", "agente"]
-    a = pd.read_csv(arquivo_a, dtype=str).set_index(chave)[coluna].fillna("").str.strip().str.lower()
-    b = pd.read_csv(arquivo_b, dtype=str).set_index(chave)[coluna].fillna("").str.strip().str.lower()
-    comuns = a.index.intersection(b.index)
-    if len(comuns) == 0:
-        raise ValueError("As planilhas dos avaliadores não têm justificativas em comum.")
-    va, vb = a.loc[comuns].tolist(), b.loc[comuns].tolist()
-    return {
-        "unidade": "justificativa CoT individual (agente x rodada)",
-        "n_justificativas": len(comuns),
-        "kappa_cohen": float(cohen_kappa_score(va, vb)),
-        "concordancia_bruta_pct": float(np.mean([x == y for x, y in zip(va, vb)]) * 100),
-        "n_divergencias": int(sum(x != y for x, y in zip(va, vb))),
+    d = por_condicao(df, condicao)
+    if d.empty:
+        return pd.DataFrame(columns=COLUNAS_ERROS_ESFORCO)
+    d = d[d["predito"].astype(float) != d["ground_truth"].astype(float)]
+    extras = d.reindex(columns=["esforco_real_horas", "titulo"])
+
+    gt = d["ground_truth"].astype(float).to_numpy()
+    predito = d["predito"].astype(float).to_numpy()
+    ts = pd.to_numeric(extras["esforco_real_horas"], errors="coerce").to_numpy(dtype=float)
+    ts = np.where(ts > 0, ts, np.nan)
+    dist_predito, dist_gt = np.abs(predito - ts), np.abs(gt - ts)
+
+    mais_proximo = np.select(
+        [np.isnan(ts), np.isclose(dist_predito, dist_gt), dist_predito < dist_gt],
+        ["sem_time_spent", "empate", "modelo"],
+        default="ground_truth",
+    )
+    return pd.DataFrame({
+        "issue_id": d.index.to_numpy(),
+        "condicao": condicao,
+        "titulo": extras["titulo"].to_numpy(),
+        "ground_truth": gt,
+        "predito": predito,
+        "time_spent_h": ts,
+        "dist_predito_time_spent": dist_predito,
+        "dist_gt_time_spent": dist_gt,
+        "mais_proximo": mais_proximo,
+    }, columns=COLUNAS_ERROS_ESFORCO)
+
+
+def analisar_erros_vs_esforco(df: pd.DataFrame, condicao: str = COND_SIM_ESP) -> dict:
+    """
+    Nas issues em que o consenso errou, o predito ficou mais perto do Time Spent que o GT?
+    As métricas usam o Time Spent como referência, e o teste compara as duas distâncias.
+    A análise é exploratória: a amostra é condicionada aos erros do modelo.
+    """
+    n_itens = len(por_condicao(df, condicao))
+    if n_itens == 0:
+        return {"status": "sem_dados", "condicao": condicao}
+
+    t = tabela_erros_vs_esforco(df, condicao)
+    v = t[t["time_spent_h"].notna()]
+    res = {
+        "condicao": condicao,
+        "n_itens": n_itens,
+        "n_acertos": n_itens - len(t),
+        "n_erros": len(t),
+        "n_erros_sem_time_spent": len(t) - len(v),
+        "n_erros_analisados": len(v),
     }
+    if v.empty:
+        res["status"] = "sem_erros_com_time_spent"
+        return res
+
+    contagem = v["mais_proximo"].value_counts()
+    ts, predito, gt = (v[c].to_numpy() for c in ("time_spent_h", "predito", "ground_truth"))
+    res.update({
+        "mais_proximo_do_time_spent": {
+            k: {"n": int(contagem.get(k, 0)), "pct": float(contagem.get(k, 0) / len(v) * 100)}
+            for k in ("modelo", "ground_truth", "empate")
+        },
+        "Predito_vs_TimeSpent": metricas(ts, predito),
+        "GroundTruth_vs_TimeSpent": metricas(ts, gt),
+        "teste_distancia_time_spent": comparar(
+            v["dist_predito_time_spent"].to_numpy(), v["dist_gt_time_spent"].to_numpy(), "predito", "ground_truth"
+        ),
+        "nota_A12": NOTA_A12.replace("de A", "do predito"),
+    })
+    return res
 
 
 # ==============================================================================
-# 9. RELATÓRIO E TABELA LATEX
+# 10. RELATÓRIO E TABELA LATEX
 # ==============================================================================
+
+ROTULOS_CONDICAO = {
+    COND_SIM_ESP: "Simultâneo especializado",
+    COND_SEQ_ESP: "Sequencial especializado",
+    COND_SIM_NEU: "Simultâneo neutro",
+    COND_SEQ_NEU: "Sequencial neutro",
+}
+CABECALHO_CONDICOES = ["Simult. espec.", "Seq. espec.", "Simult. neutro", "Seq. neutro"]
+MAGNITUDES_LATEX = {"desprezivel": "desprezível", "medio": "médio"}
+SEM_TESTE = ["---", "---", "---"]
+
 
 def _fmt(v, casas: int = 2) -> str:
-    return "---" if v is None or (isinstance(v, float) and np.isnan(v)) else f"{v:.{casas}f}"
+    """Número com vírgula decimal, como no texto das legendas; '---' quando ausente."""
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return "---"
+    return f"{v:.{casas}f}".replace(".", "{,}")
+
+
+def _fmt_p(p) -> str:
+    if p is not None and p < 0.001:
+        return "$<$0{,}001"
+    return _fmt(p, 3)
+
+
+def _fmt_pct(v, casas: int = 1) -> str:
+    texto = _fmt(v, casas)
+    return texto if texto == "---" else f"{texto}\\%"
+
+
+def _fmt_n_pct(d: Optional[dict]) -> str:
+    return "---" if not d else f"{d['n']} ({_fmt_pct(d['pct'])})"
+
+
+def _fmt_int(v) -> str:
+    return "---" if v is None else str(int(v))
+
+
+def _campo(d: Optional[dict], *chaves):
+    """Valor aninhado, ou None se algum nível faltar (ex.: condição sem dados)."""
+    for chave in chaves:
+        if not isinstance(d, dict) or chave not in d:
+            return None
+        d = d[chave]
+    return d
+
+
+def _linha(*celulas: str) -> str:
+    return "    " + " & ".join(celulas) + " \\\\"
+
+
+def _paineis(grupos: List[Tuple[str, List[str]]], n_colunas: int) -> List[str]:
+    """Blocos de linhas com um subtítulo em itálico, separados por \\midrule."""
+    corpo: List[str] = []
+    for titulo, linhas in grupos:
+        if corpo:
+            corpo.append("    \\midrule")
+        corpo.append(f"    \\multicolumn{{{n_colunas}}}{{l}}{{\\textit{{{titulo}}}}} \\\\")
+        corpo += linhas
+    return corpo
+
+
+def _celulas_metricas(m: dict) -> List[str]:
+    return [_fmt(m["MAE"]), _fmt(m["MdAE"]), _fmt_pct(m["PRED(25)"]), _fmt(m["Spearman_rs"], 3)]
+
+
+def _celulas_teste(t: dict, chave_p: str = "Wilcoxon_p") -> List[str]:
+    return [_fmt_p(t.get(chave_p)), _fmt(t.get("A12")),
+            MAGNITUDES_LATEX.get(t.get("A12_magnitude"), t.get("A12_magnitude", "---"))]
+
+
+def _tabela_latex(legenda: str, rotulo: str, colunas: str, cabecalho: List[str], corpo: List[str]) -> str:
+    return "\n".join([
+        "\\begin{table}[htbp]",
+        "  \\centering",
+        "  \\small",
+        f"  \\caption{{{legenda}}}",
+        f"  \\label{{tab:{rotulo}}}",
+        f"  \\begin{{tabular}}{{{colunas}}}",
+        "    \\toprule",
+        _linha(*[f"\\textbf{{{c}}}" for c in cabecalho]),
+        "    \\midrule",
+        *corpo,
+        "    \\bottomrule",
+        "  \\end{tabular}",
+        "\\end{table}",
+    ])
 
 
 def gerar_tabela_latex_rq1(res: dict) -> str:
     """Tabela da RQ1/H1 com a nota de leitura do Â12 na legenda."""
     if "Consenso" not in res:
         return "% Sem dados para a RQ1"
-    c = res["Consenso"]
-    linhas = [
-        "\\begin{table}[htbp]",
-        "  \\centering",
-        "  \\small",
-        "  \\caption{RQ1/H1: consenso multiagente vs. lances individuais e agregação inicial. "
-        "Nota: como a variável analisada é o erro absoluto (onde menor é melhor), valores de "
-        "$\\hat{A}_{12} < 0{,}50$ indicam a superioridade estatística do consenso "
-        "(probabilidade de apresentar erro menor que a abordagem comparada).}",
-        "  \\label{tab:resultado_rq1}",
-        "  \\begin{tabular}{lccccccc}",
-        "    \\toprule",
-        "    \\textbf{Abordagem} & \\textbf{MAE} & \\textbf{MdAE} & \\textbf{PRED(25)} & \\textbf{$r_s$} & "
-        "\\textbf{$p$ (Holm)} & \\textbf{$\\hat{A}_{12}$} & \\textbf{Magnitude} \\\\",
-        "    \\midrule",
-        f"    \\textbf{{Consenso}} & \\textbf{{{_fmt(c['MAE'])}}} & \\textbf{{{_fmt(c['MdAE'])}}} & "
-        f"\\textbf{{{_fmt(c['PRED(25)'], 1)}\\%}} & \\textbf{{{_fmt(c['Spearman_rs'], 3)}}} & --- & --- & --- \\\\",
-    ]
+    corpo = [_linha(*[f"\\textbf{{{c}}}" for c in ["Consenso", *_celulas_metricas(res["Consenso"])]], *SEM_TESTE)]
     for nome, comp in res["Comparacoes"].items():
-        m, t = comp["metricas"], comp["teste_erro_absoluto"]
         rotulo = (nome.replace("Individual_R1[", "Lance individual R1 (").replace("]", ")")
                   .replace("Mediana_R1", "Mediana dos lances R1"))
-        linhas.append(
-            f"    {rotulo} & {_fmt(m['MAE'])} & {_fmt(m['MdAE'])} & {_fmt(m['PRED(25)'], 1)}\\% & "
-            f"{_fmt(m['Spearman_rs'], 3)} & {_fmt(t.get('Wilcoxon_p_Holm'), 3)} & {_fmt(t['A12'])} & {t['A12_magnitude']} \\\\"
+        corpo.append(_linha(rotulo, *_celulas_metricas(comp["metricas"]),
+                            *_celulas_teste(comp["teste_erro_absoluto"], "Wilcoxon_p_Holm")))
+    return _tabela_latex(
+        "RQ1/H1: consenso multiagente vs. lances individuais e agregação inicial. "
+        "Nota: como a variável analisada é o erro absoluto (onde menor é melhor), valores de "
+        "$\\hat{A}_{12} < 0{,}50$ indicam a superioridade estatística do consenso "
+        "(probabilidade de apresentar erro menor que a abordagem comparada).",
+        "resultado_rq1", "lccccccc",
+        ["Abordagem", "MAE", "MdAE", "PRED(25)", "$r_s$", "$p$ (Holm)", "$\\hat{A}_{12}$", "Magnitude"],
+        corpo,
+    )
+
+
+def gerar_tabela_latex_h2(res: dict) -> str:
+    grupos = []
+    for titulo, chave in (("Análise principal: protocolo simultâneo", "principal_simultaneo"),
+                          ("Análise secundária: protocolo sequencial", "secundaria_sequencial")):
+        par = res.get(chave, {})
+        t = par.get("teste_erro_absoluto")
+        if t:
+            grupos.append((titulo, [
+                _linha(ROTULOS_CONDICAO[t["A"]], *_celulas_metricas(par[t["A"]]), *_celulas_teste(t)),
+                _linha(ROTULOS_CONDICAO[t["B"]], *_celulas_metricas(par[t["B"]]), *SEM_TESTE),
+            ]))
+    if not grupos:
+        return "% Sem dados para a RQ2.1"
+    return _tabela_latex(
+        "RQ2.1/H2: agentes especializados vs. neutros, nas mesmas issues. O teste compara o erro "
+        "absoluto; $\\hat{A}_{12} < 0{,}50$ indica que o especializado tende a errar menos que o neutro.",
+        "resultado_rq2_1_h2", "lccccccc",
+        ["Condição", "MAE", "MdAE", "PRED(25)", "$r_s$", "$p$", "$\\hat{A}_{12}$", "Magnitude"],
+        _paineis(grupos, 8),
+    )
+
+
+def gerar_tabela_latex_h3(res: dict) -> str:
+    colunas = ["Abordagem", "MAE", "MdAE", "PRED(25)", "$r_s$", "$p$", "$\\hat{A}_{12}$", "Magnitude"]
+    if "SBERT_LightGBM" in res:
+        return _tabela_latex(
+            "RQ2.2/H3: consenso especializado vs. SBERT+LightGBM, nas mesmas issues. "
+            "$\\hat{A}_{12} < 0{,}50$ indica que o MASPE tende a errar menos que o baseline.",
+            "resultado_rq2_2_h3", "lccccccc", colunas,
+            [_linha("MASPE", *_celulas_metricas(res["MASPE"]), *_celulas_teste(res["teste_erro_absoluto"])),
+             _linha("SBERT+LightGBM", *_celulas_metricas(res["SBERT_LightGBM"]), *SEM_TESTE)],
         )
-    linhas += ["    \\bottomrule", "  \\end{tabular}", "\\end{table}"]
-    return "\n".join(linhas)
+    if res.get("status") == "nao_pareado":
+        rossi = res["Rossi_publicado"]
+        return _tabela_latex(
+            "RQ2.2/H3: consenso especializado vs. valores publicados de SBERT+LightGBM (Rossi, 2026), "
+            "obtidos em outro conjunto de teste. Comparação apenas descritiva: sem as predições do "
+            "baseline por issue, H3 não pode ser testada estatisticamente.",
+            "resultado_rq2_2_h3", "lccccccc", colunas,
+            [_linha("MASPE", *_celulas_metricas(res["MASPE"]), *SEM_TESTE),
+             _linha("SBERT+LightGBM (publicado)", _fmt(rossi["MAE"]), "---", _fmt_pct(rossi["PRED(25)"]), "---", *SEM_TESTE)],
+        )
+    return "% Sem dados para a RQ2.2"
+
+
+def _linhas_h4(par: dict, cond_seq: str, cond_sim: str) -> List[str]:
+    rev = par["i_proporcao_revisoes_rumo_a_ancora"]
+    def _revisoes(d: dict) -> str:
+        return f"{d['n_aproximaram_ancora']}/{d['n_lances_revisados']} ({_fmt_pct(d['proporcao_aproximacao'] * 100 if d['n_lances_revisados'] else None)})"
+    def _comparacao(rotulo: str, t: dict) -> str:
+        return _linha(rotulo, _fmt(t["media_A"]), _fmt(t["media_B"]), *_celulas_teste(t))
+    m_seq, m_sim = par["metricas"][cond_seq], par["metricas"][cond_sim]
+    return [
+        _linha("(i) Revisões rumo à âncora", _revisoes(rev[cond_seq]), _revisoes(rev[cond_sim]), *SEM_TESTE),
+        _linha("Revisões do agente-âncora", _fmt_int(rev[cond_seq]["n_revisoes_do_agente_ancora"]),
+               _fmt_int(rev[cond_sim]["n_revisoes_do_agente_ancora"]), *SEM_TESTE),
+        _comparacao("(ii) Magnitude de alteração dos lances", par["ii_magnitude_alteracao_lances"]),
+        _comparacao("(iii) MAE do consenso", par["iii_erro_absoluto_consenso"]),
+        _linha("MdAE do consenso", _fmt(m_seq["MdAE"]), _fmt(m_sim["MdAE"]), *SEM_TESTE),
+        _linha("PRED(25) do consenso", _fmt_pct(m_seq["PRED(25)"]), _fmt_pct(m_sim["PRED(25)"]), *SEM_TESTE),
+        _linha("$r_s$ do consenso", _fmt(m_seq["Spearman_rs"], 3), _fmt(m_sim["Spearman_rs"], 3), *SEM_TESTE),
+        _comparacao("Deslocamento médio na R1", par["aux_deslocamento_R1"]),
+        _comparacao("Deslocamento médio na rodada final", par["aux_deslocamento_final"]),
+    ]
+
+
+def gerar_tabela_latex_h4(res: dict) -> str:
+    grupos = []
+    for titulo, chave, cond_seq, cond_sim in (
+        ("Análise principal: agentes especializados", "principal_especializado", COND_SEQ_ESP, COND_SIM_ESP),
+        ("Análise secundária: agentes neutros", "secundaria_neutro", COND_SEQ_NEU, COND_SIM_NEU),
+    ):
+        par = res.get(chave, {})
+        if "metricas" in par:
+            grupos.append((titulo, _linhas_h4(par, cond_seq, cond_sim)))
+    if not grupos:
+        return "% Sem dados para a RQ3"
+    return _tabela_latex(
+        "RQ3/H4: protocolo sequencial vs. simultâneo. Âncora fixa da R1: primeiro lance revelado "
+        "(sequencial) e mediana dos lances (simultâneo). As linhas sem teste são descritivas. O total de "
+        "revisões em (i) inclui as do agente-âncora, que parte de distância zero da âncora. "
+        "$\\hat{A}_{12} < 0{,}50$ indica valores menores no sequencial.",
+        "resultado_rq3_h4", "lccccc",
+        ["Indicador", "Sequencial", "Simultâneo", "$p$", "$\\hat{A}_{12}$", "Magnitude"],
+        _paineis(grupos, 6),
+    )
+
+
+def gerar_tabela_latex_h4_trajetoria(res: dict) -> str:
+    trajetorias = {
+        **(_campo(res, "principal_especializado", "trajetoria_deslocamento") or {}),
+        **(_campo(res, "secundaria_neutro", "trajetoria_deslocamento") or {}),
+    }
+    if not trajetorias:
+        return "% Sem dados para a trajetória da RQ3"
+
+    def _celula(condicao: str, rodada: str) -> str:
+        t = _campo(trajetorias, condicao, rodada)
+        return "---" if not t else f"{_fmt(t['deslocamento_medio'])} ($n$={t['n_sessoes']})"
+
+    return _tabela_latex(
+        "RQ3/H4: deslocamento médio em relação à âncora da R1, por rodada. No sequencial, o agente-âncora "
+        "fica fora apenas da R1. A partir da R2, há viés de sobrevivência: só chegam a essas rodadas "
+        "as sessões sem consenso, indicadas por $n$.",
+        "resultado_rq3_h4_trajetoria", "lcccc",
+        ["Rodada", *CABECALHO_CONDICOES],
+        [_linha(r, *[_celula(c, r) for c in CONDICOES]) for r in ("R1", "R2", "R3")],
+    )
+
+
+def gerar_tabela_latex_h5_encerramento(res: dict) -> str:
+    categorias = [("unanimidade_r1", "Unanimidade na R1"), ("unanimidade_r2", "Unanimidade na R2"),
+                  ("unanimidade_r3", "Unanimidade na R3"), ("estagnacao_r2", "Estagnação na R2 (mediana)"),
+                  ("teto_r3_mediana", "Teto na R3 (mediana)")]
+    if any(_campo(res, c, "encerramento", "outro") for c in CONDICOES):
+        categorias.append(("outro", "Outro"))
+
+    def _encerramento(condicao: str, categoria: str) -> str:
+        if _campo(res, condicao, "encerramento") is None:
+            return "---"
+        return _fmt_n_pct(_campo(res, condicao, "encerramento", categoria) or {"n": 0, "pct": 0.0})
+
+    corpo = [_linha(rotulo, *[_encerramento(c, chave) for c in CONDICOES]) for chave, rotulo in categorias]
+    corpo += [
+        "    \\midrule",
+        _linha("Taxa de unanimidade", *[_fmt_pct(_campo(res, c, "taxa_unanimidade_pct")) for c in CONDICOES]),
+        _linha("Média de rodadas", *[_fmt(_campo(res, c, "rodadas_media")) for c in CONDICOES]),
+        _linha("Itens com debate", *[_fmt_int(_campo(res, c, "n_itens_com_debate")) for c in CONDICOES]),
+        _linha("$\\sigma$ progressivamente menor (itens com debate)",
+               *[_fmt_pct(_campo(res, c, "pct_itens_com_debate_sigma_progressivamente_menor")) for c in CONDICOES]),
+    ]
+    return _tabela_latex(
+        "RQ4/H5: motivos de encerramento e rodadas, por condição, em número de itens (\\%).",
+        "resultado_rq4_h5_encerramento", "lcccc", ["Indicador", *CABECALHO_CONDICOES], corpo,
+    )
+
+
+def gerar_tabela_latex_h5_curva(res: dict) -> str:
+    grupos = []
+    for condicao in CONDICOES:
+        curva = _campo(res, condicao, "curva_sigma")
+        if curva:
+            grupos.append((ROTULOS_CONDICAO[condicao], [
+                _linha(r, _fmt_int(v["n_itens_que_chegaram"]), _fmt(v["sigma_medio"]), _fmt(v["sigma_mediano"]),
+                       _fmt(v["amplitude_degraus_media"]))
+                for r, v in curva.items()
+            ]))
+    if not grupos:
+        return "% Sem dados para a curva da RQ4"
+    return _tabela_latex(
+        "RQ4/H5: dispersão dos lances por rodada. Curva descritiva, com viés de sobrevivência: "
+        "só os itens sem consenso chegam às rodadas seguintes. Para a comparação pareada, ver as "
+        "transições entre rodadas.",
+        "resultado_rq4_h5_curva", "lcccc",
+        ["Rodada", "Itens", "$\\sigma$ médio", "$\\sigma$ mediano", "Amplitude média (degraus)"],
+        _paineis(grupos, 5),
+    )
+
+
+def gerar_tabela_latex_h5_transicoes(res: dict) -> str:
+    grupos = []
+    for condicao in CONDICOES:
+        linhas = [
+            _linha(rotulo.replace("->", "$\\rightarrow$"), _fmt_int(t["n_itens"]), _fmt(t["media_B"]), _fmt(t["media_A"]),
+                   _fmt_pct(t["pct_diminuiu"]), _fmt_pct(t["pct_igual"]), _fmt_pct(t["pct_aumentou"]), *_celulas_teste(t))
+            for rotulo, t in (_campo(res, condicao, "transicoes_sigma") or {}).items()
+            if t.get("n_itens")
+        ]
+        if linhas:
+            grupos.append((ROTULOS_CONDICAO[condicao], linhas))
+    if not grupos:
+        return "% Sem dados para as transições da RQ4"
+    return _tabela_latex(
+        "RQ4/H5: variação de $\\sigma$ entre rodadas consecutivas, pareada nos itens que chegaram à "
+        "rodada seguinte. $\\hat{A}_{12} < 0{,}50$ indica redução da dispersão.",
+        "resultado_rq4_h5_transicoes", "lccccccccc",
+        ["Transição", "Itens", "$\\sigma$ antes", "$\\sigma$ depois", "Diminuiu", "Igual", "Aumentou",
+         "$p$", "$\\hat{A}_{12}$", "Magnitude"],
+        _paineis(grupos, 10),
+    )
+
+
+def gerar_tabela_latex_erros_time_spent(res: dict) -> str:
+    if not any(_campo(res, c, "n_itens") for c in CONDICOES):
+        return "% Sem dados para os erros vs. Time Spent"
+
+    def _valores(formatar, *chaves) -> List[str]:
+        return [formatar(_campo(res, c, *chaves)) for c in CONDICOES]
+
+    def _teste(indice: int) -> List[str]:
+        return [_celulas_teste(_campo(res, c, "teste_distancia_time_spent") or {})[indice] for c in CONDICOES]
+
+    corpo = [
+        _linha("Acertos exatos", *_valores(_fmt_int, "n_acertos")),
+        _linha("Erros", *_valores(_fmt_int, "n_erros")),
+        _linha("Erros sem Time Spent", *_valores(_fmt_int, "n_erros_sem_time_spent")),
+        _linha("Erros analisados", *_valores(_fmt_int, "n_erros_analisados")),
+        "    \\midrule",
+        _linha("Predito mais próximo", *_valores(_fmt_n_pct, "mais_proximo_do_time_spent", "modelo")),
+        _linha("\\textit{Ground truth} mais próximo", *_valores(_fmt_n_pct, "mais_proximo_do_time_spent", "ground_truth")),
+        _linha("Empate", *_valores(_fmt_n_pct, "mais_proximo_do_time_spent", "empate")),
+        "    \\midrule",
+        _linha("MAE do predito (h)", *_valores(_fmt, "Predito_vs_TimeSpent", "MAE")),
+        _linha("MAE do \\textit{ground truth} (h)", *_valores(_fmt, "GroundTruth_vs_TimeSpent", "MAE")),
+        _linha("MdAE do predito (h)", *_valores(_fmt, "Predito_vs_TimeSpent", "MdAE")),
+        _linha("MdAE do \\textit{ground truth} (h)", *_valores(_fmt, "GroundTruth_vs_TimeSpent", "MdAE")),
+        _linha("$p$", *_teste(0)),
+        _linha("$\\hat{A}_{12}$", *_teste(1)),
+        _linha("Magnitude", *_teste(2)),
+    ]
+    return _tabela_latex(
+        "Análise exploratória: distância ao esforço real (Time Spent) nas issues em que o consenso errou, "
+        "considerando 1 SP = 1 h. $\\hat{A}_{12}$ compara as distâncias do predito e do \\textit{ground truth}: "
+        "valores acima de 0{,}50 indicam que o predito tende a ficar mais distante do esforço real.",
+        "resultado_erros_time_spent", "lcccc", ["Indicador", *CABECALHO_CONDICOES], corpo,
+    )
+
+
+def gerar_tabelas_latex(relatorio: dict) -> Dict[str, str]:
+    """Todas as tabelas do relatório. O H6 não entra: é qualitativo, com Kappa calculado manualmente."""
+    h4, h5 = relatorio["RQ3_H4"], relatorio["RQ4_H5"]
+    return {
+        "rq1": gerar_tabela_latex_rq1(relatorio["RQ1_H1"]),
+        "rq2_1_h2": gerar_tabela_latex_h2(relatorio["RQ2_1_H2"]),
+        "rq2_2_h3": gerar_tabela_latex_h3(relatorio["RQ2_2_H3"]),
+        "rq3_h4": gerar_tabela_latex_h4(h4),
+        "rq3_h4_trajetoria": gerar_tabela_latex_h4_trajetoria(h4),
+        "rq4_h5_encerramento": gerar_tabela_latex_h5_encerramento(h5),
+        "rq4_h5_curva": gerar_tabela_latex_h5_curva(h5),
+        "rq4_h5_transicoes": gerar_tabela_latex_h5_transicoes(h5),
+        "erros_time_spent": gerar_tabela_latex_erros_time_spent(relatorio["Erros_vs_TimeSpent"]),
+    }
 
 
 def _serializavel(o):
@@ -772,6 +1172,7 @@ def gerar_relatorio_completo(
         "RQ2_2_H3": analisar_rq2_2_h3(df, caminho_baseline),
         "RQ3_H4": analisar_rq3_h4(df),
         "RQ4_H5": {c: analisar_rq4_h5(df, c) for c in CONDICOES},
+        "Erros_vs_TimeSpent": {c: analisar_erros_vs_esforco(df, c) for c in CONDICOES},
     }
     print(json.dumps(relatorio, indent=2, ensure_ascii=False, default=_serializavel))
 
@@ -780,9 +1181,15 @@ def gerar_relatorio_completo(
     Path("results/latex").mkdir(parents=True, exist_ok=True)
     with open(f"results/analysis/relatorio{sufixo}.json", "w", encoding="utf-8") as f:
         json.dump(relatorio, f, indent=2, ensure_ascii=False, default=_serializavel)
-    with open(f"results/latex/tabela_rq1{sufixo}.tex", "w", encoding="utf-8") as f:
-        f.write(gerar_tabela_latex_rq1(relatorio["RQ1_H1"]))
-    print(f"\nRelatório: results/analysis/relatorio{sufixo}.json | Tabela: results/latex/tabela_rq1{sufixo}.tex")
+    tabelas = gerar_tabelas_latex(relatorio)
+    for nome, tabela in tabelas.items():
+        Path(f"results/latex/tabela_{nome}{sufixo}.tex").write_text(tabela, encoding="utf-8")
+    Path(f"results/latex/tabelas_todas{sufixo}.tex").write_text("\n\n".join(tabelas.values()) + "\n", encoding="utf-8")
+    pd.concat([tabela_erros_vs_esforco(df, c) for c in CONDICOES], ignore_index=True).to_csv(
+        f"results/analysis/erros_vs_time_spent{sufixo}.csv", index=False, encoding="utf-8-sig"
+    )
+    print(f"\nRelatório: results/analysis/relatorio{sufixo}.json | Tabelas: results/latex/tabelas_todas{sufixo}.tex"
+          f" | Erros vs Time Spent: results/analysis/erros_vs_time_spent{sufixo}.csv")
     return relatorio
 
 
@@ -795,13 +1202,14 @@ if __name__ == "__main__":
     ap.add_argument("--baseline-rossi", default=None, help="CSV com issue_id/IID e predito do SBERT+LightGBM")
     ap.add_argument("--amostra-h6", default=None, metavar="SAIDA.csv",
                     help="Exporta a amostra qualitativa do H6 (10 sessões) e encerra")
-    ap.add_argument("--kappa", nargs=2, default=None, metavar=("AVALIADOR_A.csv", "AVALIADOR_B.csv"),
-                    help="Calcula o Kappa de Cohen entre as codificações do H6 e encerra")
+    # Kappa do H6 calculado manualmente por enquanto (ver concordancia_h6):
+    # ap.add_argument("--kappa", nargs=2, default=None, metavar=("AVALIADOR_A.csv", "AVALIADOR_B.csv"),
+    #                 help="Calcula o Kappa de Cohen entre as codificações do H6 e encerra")
     args = ap.parse_args()
 
-    if args.kappa:
-        print(json.dumps(concordancia_h6(*args.kappa), indent=2, ensure_ascii=False))
-    elif args.amostra_h6:
+    # if args.kappa:
+    #     print(json.dumps(concordancia_h6(*args.kappa), indent=2, ensure_ascii=False))
+    if args.amostra_h6:
         dados = carregar_resultados(args.padrao, modelo=args.modelo, modo_contexto=args.contexto, projeto=args.projeto)
         amostra = gerar_amostra_h6(dados, caminho_saida=args.amostra_h6)
         n_sessoes = amostra["issue_id"].nunique() if not amostra.empty else 0

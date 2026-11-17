@@ -21,11 +21,11 @@ class ConsensoState(TypedDict):
     escala_fibonacci: str                               # Escala usada dependendo do dataset
     protocolo: str                                      # "simultaneo" | "sequencial"
     especializado: bool                                 # True se usa persona, False se neutro
-    papeis_agentes: Optional[dict[str, str]]             # Mapeamento dinâmico agente_id -> papel efetivo (rotação de papéis)
+    papeis_agentes: Optional[dict[str, str]]             # Mapeamento agente_id -> papel (fixo, sem rotação)
     estimativas: Annotated[list[Estimativa], operator.add]
     rodada: int                                         # Rodada corrente (inicia em 1)
     convergiu: bool                                     # True se atingiu consenso na rodada
-    motivo_convergencia: Optional[str]                  # Ex: "unanime_r1", "adjacente_r2", "desempate_mediana_r3"
+    motivo_convergencia: Optional[str]                  # Ex: "consenso_unanime_r1", "estagnacao_r2_mediana", "desempate_mediana_r3"
     dispersao_degraus: Optional[int]                    # Distância em degraus Fibonacci entre min e max da rodada
     rodadas_consecutivas_convergidas: Optional[int]     # Campo de retrocompatibilidade
     consenso: float                                     # Valor final acordado
