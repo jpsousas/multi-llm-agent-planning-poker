@@ -1,11 +1,13 @@
 from typing import Optional
 
-PROMPT_BASE = """Você é um especialista em desenvolvimento de software participando de uma sessão de Planning Poker de uma equipe ágil.{papel} Sua responsabilidade é estimar o esforço relativo necessário para implementar o item do backlog apresentado, utilizando estritamente a sequência de Fibonacci: {escala_fibonacci}
+PROMPT_BASE = """Você é um especialista em desenvolvimento de software participando de uma sessão de Planning Poker de uma equipe ágil.{papel} Sua responsabilidade é estimar o esforço necessário para implementar o item do backlog apresentado, em horas de trabalho, utilizando estritamente a sequência de Fibonacci: {escala_fibonacci} (cada valor é um número de horas).
 
-Critérios de avaliação para estimativa de Story Points:
+Critérios de avaliação para a estimativa de esforço:
 - Complexidade técnica (arquitetura, algoritmos, dependências de sistemas externos).
 - Volume de trabalho (quantidade de código, telas, endpoints, modelos ou testes).
 - Incerteza e risco (ambiguidades de requisitos, cenários de borda, impacto potencial em regressão).
+
+Algumas partes do texto foram abreviadas e aparecem como marcadores entre colchetes: [link] (endereço web removido), [imagem] (imagem removida), [código/log] seguido das primeiras linhas e de [... N linhas omitidas ...] (bloco de código ou de registro encurtado), "…/arquivo" ou "…Classe.metodo" (caminho ou nome longo reduzido ao final), [token-longo] (identificador ou código longo omitido) e [... texto truncado ...] (o texto continua além do que foi mostrado). Esses marcadores indicam informação ausente; não tente adivinhá-la.
 
 Responda OBRIGATORIAMENTE em JSON válido no formato:
 {{
@@ -46,9 +48,9 @@ def montar_prompt_item(
             linha = f'- "{h["titulo"]}"'
             if h.get("descricao"):
                 linha += f' — {h["descricao"]}'
-            linha += f' → Estimativa Planejada em Story Points: {sp} SP'
+            linha += f' → Estimativa Planejada: {sp} h'
             if h.get("esforco_real_horas") is not None:
-                linha += f' | Esforço Real Gasto em Horas: {h["esforco_real_horas"]:g}h'
+                linha += f' | Esforço Real Gasto: {h["esforco_real_horas"]:g} h'
             linhas_hist.append(linha)
         partes.append(f"{header}\n" + "\n".join(linhas_hist) + "\n")
 
@@ -69,11 +71,13 @@ def montar_prompt_item(
                 "(você pode revisar sua estimativa ou mantê-la justificando o motivo técnico).\n"
             )
 
-    # 3. Item a estimar
+        # 3. Item a estimar
     partes.append(
         "### Item do Backlog a Estimar:\n"
         f"**Título:** {titulo}\n"
-        f"**Descrição:** {descricao if descricao else 'Sem descrição detalhada fornecida.'}"
+        f"**Descrição:** {descricao if descricao else 'Sem descrição detalhada fornecida.'}\n\n"
+        "Lembre-se: sua tarefa é apenas ESTIMAR o esforço da tarefa, você NÃO deve resolver ou implementar o código da issue.\n"
+        "Responda OBRIGATORIAMENTE em JSON válido com as chaves \"justificativa\" e \"story_points\"."
     )
 
     return "\n".join(partes)
@@ -86,7 +90,7 @@ if __name__ == "__main__":
         titulo="Criar endpoint de autenticação OAuth2",
         descricao="Implementar fluxo de autorização com tokens JWT e refresh tokens.",
         historicos=[{"titulo": "CRUD de usuários", "story_points": 3}, {"titulo": "Gateway de Pagamento", "story_points": 13}],
-        contexto_rodada="Backend estimou 13 SP: APIs complexas.\nFrontend estimou 3 SP: Apenas formulário de login.",
+        contexto_rodada="Backend estimou 13 horas: APIs complexas.\nFrontend estimou 3 horas: Apenas formulário de login.",
         rodada=2,
         protocolo="simultaneo"
     ))

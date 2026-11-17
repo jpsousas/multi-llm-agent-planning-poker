@@ -97,5 +97,55 @@ class TestSequencial(unittest.TestCase):
         self.assertEqual(primeiro["ordem_revelacao"], 1)
 
 
+class TestParadaNoGrafo(unittest.TestCase):
+    """A regra de parada (unanimidade / estagnação R2 / teto R3) acontecendo dentro do grafo real."""
+
+    def test_unanimidade_na_r1_encerra_com_uma_chamada_por_agente(self):
+        chamadas, final = _rodar("simultaneo_especializado", {"frontend": [5], "backend": [5], "qa": [5]})
+        self.assertEqual(len(chamadas), 3)
+        self.assertTrue(final["convergiu"])
+        self.assertEqual(final["consenso"], 5.0)
+        self.assertEqual(final["rodada"] - 1, 1)
+
+    def test_estagnacao_na_r2_encerra_com_a_mediana(self):
+        lances = {"frontend": [3, 3], "backend": [13, 13], "qa": [8, 8]}
+        chamadas, final = _rodar("simultaneo_especializado", lances)
+        self.assertEqual(len(chamadas), 6)                       # 2 rodadas x 3 agentes
+        self.assertTrue(final["convergiu"])
+        self.assertTrue(final["motivo_convergencia"].startswith("estagnacao_r2_mediana"))
+        self.assertEqual(final["consenso"], 8.0)
+
+    def test_teto_na_r3_sem_unanimidade_usa_mediana(self):
+        lances = {"frontend": [3, 5, 5], "backend": [13, 8, 8], "qa": [21, 13, 13]}
+        chamadas, final = _rodar("simultaneo_especializado", lances)
+        self.assertEqual(len(chamadas), 9)
+        self.assertFalse(final["convergiu"])
+        self.assertTrue(final["motivo_convergencia"].startswith("desempate_mediana_r3"))
+        self.assertEqual(final["consenso"], 8.0)
+        self.assertEqual(final["rodada"] - 1, 3)
+
+    def test_registro_de_auditoria_do_contexto_recebido(self):
+        _, final = _rodar("simultaneo_especializado", {"frontend": [3, 8], "backend": [13, 8], "qa": [8, 8]})
+        r1 = [e for e in final["estimativas"] if e["rodada"] == 1]
+        r2 = [e for e in final["estimativas"] if e["rodada"] == 2]
+        self.assertTrue(all(e["contexto_recebido"] is None for e in r1))
+        self.assertTrue(all(e["contexto_recebido"] for e in r2))
+        self.assertTrue(all(e["ordem_revelacao"] is None for e in r1 + r2))   # simultâneo: revelação cega
+
+    def test_sequencial_ordem_revelacao_registrada(self):
+        _, final = _rodar("sequencial_especializado", {"frontend": [5, 5], "backend": [5, 5], "qa": [5, 5]})
+        r1 = sorted((e for e in final["estimativas"] if e["rodada"] == 1), key=lambda e: e["ordem_revelacao"])
+        self.assertEqual([e["papel"] for e in r1], ["frontend", "backend", "qa"])
+        self.assertEqual([e["ordem_revelacao"] for e in r1], [1, 2, 3])
+
+    def test_sequencial_r2_tambem_encadeia_e_ve_o_debate_anterior(self):
+        chamadas, _ = _rodar("sequencial_especializado", {"frontend": [3, 5, 5], "backend": [8, 5, 5], "qa": [13, 8, 8]})
+        r2 = [c for c in chamadas if c[0] == 2]
+        self.assertEqual([p for _, p, _ in r2], ["frontend", "backend", "qa"])
+        self.assertIn("Lances da Rodada 1", r2[0][2])             # debate da R1 chega ao primeiro da R2
+        self.assertNotIn("Lances já revelados nesta rodada", r2[0][2])
+        self.assertIn("Lances já revelados nesta rodada", r2[2][2])
+
+
 if __name__ == "__main__":
     unittest.main()
