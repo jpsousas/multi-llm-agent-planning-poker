@@ -4,7 +4,8 @@ tests/test_split_parser.py
 Testes rápidos (sem LLM e sem embeddings) para:
   - leitura do CSV do SIS-ASTROS (cabeçalhos, filtros, Time Spent);
   - split temporal 70/30 e manifesto;
-  - parser das respostas dos agentes (extrair_json).
+  - parser das respostas dos agentes (extrair_json);
+  - fase de DESENVOLVIMENTO (montar_dataset_sis_astros(fase="dev")): o bloco de teste nunca é alvo nem exemplo.
 
 Execução (a partir da pasta multi-llm-agent-planning-poker):
     python -m unittest tests.test_split_parser -v
@@ -27,6 +28,9 @@ from src.sis_astros import (
     _amostrar_few_shot_estratificado,
 )
 from src.agents import extrair_json
+from unittest.mock import patch
+import src.sis_astros as sa
+from tests.fakes import csv_sis_astros, linha, patch_retrieval
 
 CABECALHO = ["IID", "Title", "State", "Author", "Assignee", "Time Estimate", "Time Spent",
              "Created At", "Closed At", "Milestone", "Labels", "Description", "URL"]
@@ -104,6 +108,22 @@ class TestCarregarSisAstros(unittest.TestCase):
         self.assertIsNone(parse_horas_gitlab(""))
         self.assertIsNone(parse_horas_gitlab("abc"))
 
+    def test_parse_horas_gitlab_com_segundos(self):
+        """Formato com segundos: '101h 55m 20s' — deve ser parseado corretamente."""
+        resultado = parse_horas_gitlab("101h 55m 20s")
+        esperado = 101.0 + 55.0 / 60.0 + 20.0 / 3600.0  # ~101.9222 h
+        self.assertIsNotNone(resultado, "101h 55m 20s deve retornar um valor, não None")
+        self.assertAlmostEqual(resultado, esperado, places=4)
+
+    def test_parse_horas_gitlab_apenas_segundos(self):
+        """Apenas segundos: '90s' = 0.025 h."""
+        self.assertAlmostEqual(parse_horas_gitlab("90s"), 90.0 / 3600.0, places=6)
+
+    def test_parse_horas_gitlab_semanas_dias_horas_minutos_segundos(self):
+        """Formato completo: '1w 2d 3h 15m 30s'."""
+        esperado = 40.0 + 2 * 8.0 + 3.0 + 15.0 / 60.0 + 30.0 / 3600.0
+        self.assertAlmostEqual(parse_horas_gitlab("1w 2d 3h 15m 30s"), esperado, places=4)
+
 
 class TestSplitTemporal(unittest.TestCase):
 
@@ -135,6 +155,82 @@ class TestSplitTemporal(unittest.TestCase):
         itens = self._itens([1, 2, 3, 5, 8])
         ex = _amostrar_few_shot_estratificado(itens, n=5, item_alvo=itens[2])
         self.assertNotIn("2", [e["ID"] for e in ex])
+
+
+class TestFaseDev(unittest.TestCase):
+    """20 issues -> histórico 14 (70%) / teste 6. Dev: base = 9 (70% de 14), alvos = 5 (os últimos do histórico)."""
+
+    SPS = [1, 2, 3, 5, 8, 13, 21, 3, 5, 8, 13, 2, 3, 5, 8, 1, 2, 3, 5, 8]
+
+    def setUp(self):
+        self.csv = csv_sis_astros([linha(i, sp, i, titulo=f"T{i}", desc=f"descricao {i}") for i, sp in enumerate(self.SPS, start=1)])
+        orig = sa.dividir_temporal
+        self.p = patch.object(sa, "dividir_temporal",
+                              lambda itens, prop, caminho_csv=None, caminho_manifesto=None: orig(itens, prop, caminho_csv=caminho_csv, caminho_manifesto=None))
+        self.p.start()
+        self.ids_teste = {str(i) for i in range(15, 21)}
+
+    def tearDown(self):
+        self.p.stop()
+        os.unlink(self.csv)
+
+    def test_dev_alvos_sao_o_fim_do_historico(self):
+        ds = sa.montar_dataset_sis_astros(self.csv, fase="dev")
+        self.assertEqual([d["issue_id"] for d in ds], ["10", "11", "12", "13", "14"])
+        self.assertTrue(all(d["fase"] == "dev" for d in ds))
+
+    def test_dev_nunca_toca_o_bloco_de_teste_few_shot(self):
+        ds = sa.montar_dataset_sis_astros(self.csv, fase="dev", n_historico=3)
+        for d in ds:
+            self.assertNotIn(d["issue_id"], self.ids_teste)
+            for h in d["historicos"]:
+                self.assertNotIn(h["id"], self.ids_teste)
+                self.assertLessEqual(int(h["id"]), 9)                       # exemplos só da base (70% mais antigos do histórico)
+
+    def test_teste_alvos_sao_os_30_por_cento_finais(self):
+        ds = sa.montar_dataset_sis_astros(self.csv, fase="teste")
+        self.assertEqual({d["issue_id"] for d in ds}, self.ids_teste)
+        for d in ds:
+            for h in d["historicos"]:
+                self.assertLessEqual(int(h["id"]), 14)                      # nunca um item do teste como exemplo
+
+    def test_dev_rag_so_recupera_da_base_e_registra_diagnostico(self):
+        with patch_retrieval():
+            ds = sa.montar_dataset_sis_astros(self.csv, fase="dev", usar_rag=True, k_rag=3)
+        for d in ds:
+            self.assertEqual(d["modo_contexto"], "rag")
+            self.assertEqual(d["k_contexto"], 3)
+            self.assertLessEqual(len(d["historicos"]), 3)
+            for h in d["historicos"]:
+                self.assertLessEqual(int(h["id"]), 9)
+                self.assertNotIn(h["id"], self.ids_teste)
+                self.assertIn("similaridade", h)
+            self.assertEqual(d["rag_meta"]["limiar"], 0.95)                  # limiar congelado é o padrão
+            self.assertIn("sim_max", d["rag_meta"])
+
+    def test_dev_rag_indice_so_com_a_base(self):
+        import src.retrieval as r
+        with patch_retrieval():
+            sa.montar_dataset_sis_astros(self.csv, fase="dev", usar_rag=True)
+            indices = list(r._indices_memoria.values())
+        self.assertEqual(len(indices), 1)
+        self.assertEqual([it["ID"] for it in indices[0]["itens"]], [str(i) for i in range(1, 10)])
+
+    def test_k_padrao_vem_do_config(self):
+        from src.config import K_RAG
+        self.assertEqual(K_RAG, 3)
+        with patch_retrieval():
+            ds = sa.montar_dataset_sis_astros(self.csv, fase="dev", usar_rag=True)
+        self.assertEqual(ds[0]["k_contexto"], K_RAG)
+
+    def test_fase_invalida(self):
+        with self.assertRaises(ValueError):
+            sa.montar_dataset_sis_astros(self.csv, fase="producao")
+
+    def test_ground_truth_e_esforco_real_chegam_ao_item(self):
+        ds = sa.montar_dataset_sis_astros(self.csv, fase="dev")
+        self.assertEqual(ds[0]["ground_truth"], float(self.SPS[9]))
+        self.assertIsNone(ds[0]["esforco_real_horas"])
 
 
 class TestExtrairJson(unittest.TestCase):
