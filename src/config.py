@@ -22,7 +22,13 @@ COLUNAS_SIS_ASTROS = [
 # Sem estas o experimento não roda (ID, texto, ground truth e data para o split temporal)
 COLUNAS_OBRIGATORIAS_SIS_ASTROS = ["IID", "Title", "Time Estimate", "Created At"]
 
-# Limite de caracteres da descrição no PROMPT — o mesmo para a issue estimada e para as
+# Recuperação (RAG) — decisões fixadas após o desenvolvimento (comparar_knn.py / comparar_preprocessamento.py):
+#   modelo SBERT multilíngue mpnet (768 dim), k = 3 exemplos, quase-duplicatas (cosseno >= 0,95) excluídas.
+MODELO_EMBEDDINGS = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+K_RAG = 3
+LIMIAR_DUPLICATA = 0.95
+
+# [LEGADO — não usado] Limite de caracteres da descrição no PROMPT — o mesmo para a issue estimada e para as
 # issues históricas (RAG/few-shot). None = descrição completa. Não afeta os embeddings.
 LIMITE_DESCRICAO_PROMPT = 2000
 
