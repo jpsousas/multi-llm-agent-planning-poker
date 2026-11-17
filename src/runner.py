@@ -1,17 +1,25 @@
-import json, time, asyncio, traceback, os
+import json, time, asyncio, traceback, os, hashlib
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from tqdm import tqdm
 from src.graph import construir_grafo
-from src.config import CONDICOES, ESCALAS_FIBONACCI, Condicao, MODELO_BASE, CAMINHO_SIS_ASTROS
-from src.sis_astros import montar_dataset_sis_astros
+from src.config import (CONDICOES, ESCALAS_FIBONACCI, Condicao, MODELO_BASE, CAMINHO_SIS_ASTROS,
+                        K_RAG, LIMIAR_DUPLICATA, MODELO_EMBEDDINGS)
+from src.sis_astros import (montar_dataset_sis_astros, LIMPAR_TEXTO, ORCAMENTO_TOKENS_EXEMPLO,
+                            ORCAMENTO_TOKENS_ALVO, CONTEXTO_SERVIDOR_POR_SLOT, RESERVA_PROMPT_TOKENS)
+from src.prompts import PROMPT_BASE, PAPEIS
 from dotenv import load_dotenv
 
 load_dotenv()
 
 ESCALA_SIS_ASTROS = ESCALAS_FIBONACCI["SIS-ASTROS"]
+
+# Identifica a versão do prompt de sistema (registrada em cada linha do JSONL; congele antes do teste)
+# Servidor local com 1 slot (llama-server -np 1): chamadas simultâneas só enfileirariam e estourariam o timeout.
+MAX_CONCORRENCIA = int(os.getenv("MAX_CONCORRENCIA", "1"))
+HASH_PROMPT = hashlib.md5((PROMPT_BASE + "".join(f"{k}={v}" for k, v in sorted(PAPEIS.items()))).encode("utf-8")).hexdigest()[:10]
 
 
 def _condicao_com_modelo(
@@ -166,6 +174,7 @@ async def rodar_condicao(
     url_override: Optional[str] = None,
     temperatura: Optional[float] = None,
     seed: Optional[int] = None,
+    fase: str = "teste",
 ):
     """Executa uma condição experimental sobre o conjunto de dados e grava logs em JSONL e Markdown."""
     if nome_cond not in CONDICOES:
@@ -173,14 +182,19 @@ async def rodar_condicao(
 
     cond = _condicao_com_modelo(nome_cond, modelo_override, url_override, temperatura, seed)
     grafo = construir_grafo(cond)
+    # Dev e teste nunca compartilham pasta: o analysis.py (results/raw) só enxerga o teste.
+    if fase == "dev" and saida_dir == "results/raw":
+        saida_dir = "results/dev"
+    dir_transcricoes = "results/transcripts_dev" if fase == "dev" else "results/transcripts"
     Path(saida_dir).mkdir(parents=True, exist_ok=True)
 
     # Nome do arquivo inclui o modelo para não misturar resultados de modelos diferentes
     # ...e o modo de contexto, para não misturar RAG com few-shot
     slug_modelo = (modelo_override or "default").replace("/", "_").replace(":", "-")
     modo = dataset[0].get("modo_contexto", "few_shot") if dataset else "few_shot"
-    caminho = Path(saida_dir) / f"{projeto}__{nome_cond}__{slug_modelo}__{modo}.jsonl"
-    caminho_falhas = Path(saida_dir) / f"{projeto}__{nome_cond}__{slug_modelo}__{modo}__falhas.jsonl"
+    tag = ("__limpo" if LIMPAR_TEXTO else "") + ("__dev" if fase == "dev" else "")
+    caminho = Path(saida_dir) / f"{projeto}__{nome_cond}__{slug_modelo}__{modo}{tag}.jsonl"
+    caminho_falhas = Path(saida_dir) / f"{projeto}__{nome_cond}__{slug_modelo}__{modo}{tag}__falhas.jsonl"
 
     ja_feitos = set()
     if caminho.exists():
@@ -230,7 +244,7 @@ async def rodar_condicao(
             }
             t0 = time.perf_counter()
             try:
-                final = await grafo.ainvoke(entrada, {"recursion_limit": 50, "max_concurrent": 5})
+                final = await grafo.ainvoke(entrada, {"recursion_limit": 50, "max_concurrency": MAX_CONCORRENCIA})
             except Exception as e:
                 registro_falha = {
                     "issue_id": item["issue_id"],
@@ -262,6 +276,19 @@ async def rodar_condicao(
                 "modelo": modelo_label,
                 "timestamp_inicio": ts_inicio,
                 "timestamp_fim": ts_fim,
+                "fase": fase,
+                "hash_prompt": HASH_PROMPT,
+                "configuracao": {
+                    "limpar_texto": LIMPAR_TEXTO,
+                    "orcamento_tokens_exemplo": ORCAMENTO_TOKENS_EXEMPLO,
+                    "orcamento_tokens_alvo": ORCAMENTO_TOKENS_ALVO,
+                    "contexto_por_slot": CONTEXTO_SERVIDOR_POR_SLOT,
+                    "reserva_prompt": RESERVA_PROMPT_TOKENS,
+                    "modelo_embeddings": MODELO_EMBEDDINGS if item.get("modo_contexto") == "rag" else None,
+                    "limiar_duplicata": (item.get("rag_meta") or {}).get("limiar"),
+                },
+                "prep_meta": item.get("prep_meta"),     # contadores (tokens, truncamentos); nunca texto
+                "rag_meta": item.get("rag_meta"),       # sim_max, exclusões
                 "seed": getattr(cond, "seed", 42),
                 "temperatura": cond.temperatura,
                 "protocolo": cond.protocolo,
@@ -304,7 +331,7 @@ async def rodar_condicao(
 
             f.write(json.dumps(registro, ensure_ascii=False) + "\n")
             f.flush()
-            salvar_transcricao_xai(registro)
+            salvar_transcricao_xai(registro, diretorio_base=dir_transcricoes)
 
 if __name__ == "__main__":
     import argparse
@@ -318,6 +345,10 @@ Exemplos de uso (CSV padrão: data/sis_astros/dataset_sis_astros.csv — ver src
 
   # Execução no laboratório com DeepSeek 70B via Ollama:
   python -m src.runner --modelo deepseek-r1-distill-llama-70b --url http://localhost:11434/v1 --rag
+
+  # Desenvolvimento (não toca o bloco de teste), 20 issues, 4 condições:
+  python -m src.runner --fase dev --rag -n 20 --condicao todas --url http://localhost:8080/v1 --modelo qwen3-14b
+  # (LIMPAR_TEXTO=1 liga a limpeza determinística; DEBUG_PROMPT=1 imprime os prompts — confidencial)
 
   # Todas as condições, outro arquivo:
   python -m src.runner --arquivo caminho/outro.csv --condicao todas --rag
@@ -338,8 +369,15 @@ Exemplos de uso (CSV padrão: data/sis_astros/dataset_sis_astros.csv — ver src
                         help="Número máximo de issues a processar (útil para testes)")
     parser.add_argument("--rag", action="store_true",
                         help="Ativa busca semântica de issues similares (RAG) ao invés de Few-Shot estratificado")
-    parser.add_argument("--k-rag", type=int, default=3,
-                        help="Número de issues similares a recuperar no modo RAG (padrão: 3)")
+    parser.add_argument("--k-rag", type=int, default=K_RAG,
+                        help=f"Número de issues similares a recuperar no modo RAG (padrão: {K_RAG})")
+    parser.add_argument("--limiar", type=float, default=LIMIAR_DUPLICATA,
+                        help=f"Cosseno a partir do qual um candidato é quase-duplicata e é excluído (padrão: {LIMIAR_DUPLICATA})")
+    parser.add_argument("--fase", choices=["dev", "teste"], default="teste",
+                        help="dev: alvos = últimos 30%% do histórico (bloco de teste intocado; saída em results/dev). "
+                             "teste: alvos = 30%% mais recentes. Padrão: teste")
+    parser.add_argument("-n", dest="limite_n", type=int, default=None,
+                        help="Atalho para --limite (primeiras N issues; as mesmas em todas as condições)")
     parser.add_argument("--temperatura", type=float, default=None,
                         help="Temperatura de geração (padrão da Condicao: 0.0)")
     parser.add_argument("--seed", type=int, default=None,
@@ -352,6 +390,8 @@ Exemplos de uso (CSV padrão: data/sis_astros/dataset_sis_astros.csv — ver src
         caminho_arquivo=args.arquivo,
         usar_rag=args.rag,
         k_rag=args.k_rag,
+        fase=args.fase,
+        limiar_duplicata=args.limiar,
     )
 
     condicoes_executar = list(CONDICOES.keys()) if args.condicao == "todas" else [args.condicao]
@@ -360,9 +400,10 @@ Exemplos de uso (CSV padrão: data/sis_astros/dataset_sis_astros.csv — ver src
         asyncio.run(rodar_condicao(
             c, dataset,
             projeto="SIS-ASTROS",
-            limite=args.limite,
+            limite=args.limite_n or args.limite,
             modelo_override=args.modelo,
             url_override=args.url,
             temperatura=args.temperatura,
             seed=args.seed,
+            fase=args.fase,
         ))
